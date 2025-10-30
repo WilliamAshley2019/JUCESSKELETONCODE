@@ -1,0 +1,284 @@
+/**
+ * JUCE Audio Plugin Skeleton Template (2025 Edition - AI-Enhanced)
+ * 
+ * Evolutions for AI Assistance:
+ * - Modular DSP hooks (virtual applyCustomDSP) for easy overrides.
+ * - 2025 JUCE 8 stubs: Parameter groups, double precision, bypass, Arm workgroup.
+ * - AI prompts: Tagged sections for targeted extensions (e.g., "AI: Add your EQ here").
+ * - Streamlined FIFO with ScopedLock for thread safety.
+ * 
+ * Demonstrates the 3-scope rule: Init (prepareToPlay), Real-time (processBlock), Non-RT (GUI/state).
+ * Hybrid: Variable external + fixed internal FIFO for determinism/low spikes.
+ */
+
+#pragma once
+#include <JuceHeader.h>
+
+// AI: Extend this enum for custom modes (e.g., LOW_LATENCY = 64)
+enum class ProcessingMode { HYBRID_FIXED = 0, VARIABLE_ONLY };
+
+class MyPluginAudioProcessor : public juce::AudioProcessor
+{
+public:
+    //==============================================================================
+    MyPluginAudioProcessor()
+        : AudioProcessor(BusesProperties()
+                        .withInput("Input", juce::AudioChannelSet::stereo(), true)
+                        .withOutput("Output", juce::AudioChannelSet::stereo(), true))
+    {
+        // 2025 Best Practice: Use parameter groups for future-proofing
+        addParameterGroup(std::make_unique<juce::AudioProcessorParameterGroup>("group1", "Main Controls", ""));
+        addParameter(mBypassParam = std::make_unique<juce::AudioParameterBool>("bypass", "Bypass", false));
+        
+        // AI: Add params here, e.g., addParameter(std::make_unique<juce::AudioParameterFloat>("gain", "Gain", 0.0f, 1.0f, 0.5f));
+    }
+
+    ~MyPluginAudioProcessor() override = default;
+
+    //==============================================================================
+    // INITIALIZATION SCOPE: Heavy setup, allocations (non-RT safe)
+    //==============================================================================
+    void prepareToPlay(double sampleRate, int maxSamplesPerBlock) override
+    {
+        juce::ScopedNoDenormals noDenormals; // Global denormal flush (2025 cross-platform)
+        
+        setRateAndBufferSizeDetails(sampleRate, maxSamplesPerBlock);
+        currentSampleRate = sampleRate;
+        
+        // 2025: Handle double precision
+        auto precision = getProcessingPrecision();
+        isDoublePrecision = (precision == juce::AudioProcessor::doublePrecision);
+        
+        // AI: Set mode dynamically, e.g., if (lowLatencyMode) kInternalBlockSize = 64;
+        constexpr int fftOrder = 9; // 512 samples; AI: Adjust for your needs
+        kInternalBlockSize = 1 << fftOrder;
+        
+        // Allocate fixed internal buffer (precision-aware)
+        internalBuffer.setSize(2, kInternalBlockSize, false, true, true);
+        if (isDoublePrecision) {
+            // AI: Extend for double: internalBufferDouble.setSize(2, kInternalBlockSize);
+        }
+        
+        // FFT plan (reusable)
+        fftPlan = std::make_unique<juce::dsp::FFT>(isDoublePrecision ? fftOrder : fftOrder, isDoublePrecision);
+        
+        // FIFO: Sized for max + internal (2025: Use AudioBuffer for simplicity)
+        const int fifoSize = maxSamplesPerBlock + kInternalBlockSize;
+        inputFIFO.setSize(2, fifoSize, false, true, true);
+        outputFIFO.setSize(2, fifoSize, false, true, true);
+        
+        // Reset FIFO state
+        resetFIFOs();
+        
+        // Latency: Report for PDC (fixed block overhead)
+        setLatencySamples(kInternalBlockSize);
+        
+        // 2025 Arm: Join audio workgroup on Apple
+        #if JUCE_IOS || JUCE_MAC
+        audioWorkgroupContextChanged(false);
+        #endif
+        
+        // AI: Precompute here, e.g., computeFilterCoefficients();
+    }
+
+    void releaseResources() override
+    {
+        inputFIFO.clear();
+        outputFIFO.clear();
+        resetFIFOs();
+    }
+
+    void reset() override
+    {
+        releaseResources(); // Clears state
+        // AI: Reset custom state, e.g., myIIRFilter.reset();
+    }
+
+    // 2025: Arm workgroup callback (Apple real-time priority)
+    void audioWorkgroupContextChanged(bool isActive) override
+    {
+        // AI: Implement for Arm threading, e.g., set thread priority if isActive
+        juce::ignoreUnused(isActive);
+    }
+
+    //==============================================================================
+    // REAL-TIME SCOPE: Predictable execution only (no allocations, locks >1ms)
+    //==============================================================================
+    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
+    {
+        juce::ScopedNoDenormals noDenormals;
+        
+        if (isSuspended()) return; // 2025: Early exit if suspended
+        
+        // 2025 Bypass: Check param (non-RT safe via tree)
+        if (mBypassParam && *mBypassParam) {
+            processBlockBypassed(buffer, midi);
+            return;
+        }
+        
+        const int numChannels = buffer.getNumChannels();
+        const int numSamples = buffer.getNumSamples();
+        jassert(numSamples > 0 && numSamples <= inputFIFO.getNumSamples() - kInternalBlockSize);
+        
+        // Scoped lock for FIFO (2025: Safe for shared access, keep short)
+        {
+            const juce::ScopedLock sl(getCallbackLock());
+            for (int ch = 0; ch < numChannels; ++ch) {
+                processChannelFIFO(buffer, ch, numSamples);
+            }
+        }
+        
+        // AI: Post-process if needed, e.g., applyGlobalGain(buffer);
+    }
+
+    void processBlockBypassed(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
+    {
+        // 2025: Default pass-through with latency compensation
+        juce::AudioProcessor::processBlockBypassed(buffer, midi);
+    }
+
+private:
+    //==============================================================================
+    // FIFO Helper (Modular for AI extensions)
+    //==============================================================================
+    struct FIFOState {
+        int writePos = 0, readPos = 0, used = 0;
+    };
+    FIFOState inputState{}, outputState{};
+
+    void resetFIFOs() {
+        inputState = {}; outputState = {};
+        inputFIFO.clear(); outputFIFO.clear();
+    }
+
+    void processChannelFIFO(juce::AudioBuffer<float>& buffer, int ch, int numSamples)
+    {
+        auto* data = buffer.getWritePointer(ch);
+        auto* inData = inputFIFO.getWritePointer(ch);
+        auto* outData = outputFIFO.getWritePointer(ch);
+        const int fifoSize = inputFIFO.getNumSamples();
+        
+        // Write to input FIFO
+        for (int i = 0; i < numSamples; ++i) {
+            inData[inputState.writePos] = data[i];
+            inputState.writePos = (inputState.writePos + 1) % fifoSize;
+            ++inputState.used;
+        }
+        
+        // Process fixed blocks
+        int outPos = 0;
+        while (inputState.used >= kInternalBlockSize && outPos < numSamples) {
+            // Extract fixed block
+            for (int i = 0; i < kInternalBlockSize; ++i) {
+                internalBuffer.setSample(ch, i, inData[inputState.readPos]);
+                inputState.readPos = (inputState.readPos + 1) % fifoSize;
+            }
+            inputState.used -= kInternalBlockSize;
+            
+            // Core DSP: Fixed-size only (AI-friendly hook)
+            processFixedBlock(internalBuffer, ch);
+            
+            // Write to output FIFO
+            for (int i = 0; i < kInternalBlockSize; ++i) {
+                outData[outputState.writePos] = internalBuffer.getSample(ch, i);
+                outputState.writePos = (outputState.writePos + 1) % fifoSize;
+                ++outputState.used;
+            }
+            
+            // Output ready samples
+            const int toOut = std::min(kInternalBlockSize, numSamples - outPos);
+            for (int i = 0; i < toOut; ++i) {
+                data[outPos++] = outData[outputState.readPos];
+                outputState.readPos = (outputState.readPos + 1) % fifoSize;
+                --outputState.used;
+            }
+        }
+        
+        // Pad if FIFO underflow (rare after init)
+        while (outPos < numSamples) data[outPos++] = 0.0f;
+    }
+
+    //==============================================================================
+    // FIXED DSP HOOK: AI's playground (override for custom logic)
+    //==============================================================================
+    virtual void processFixedBlock(juce::AudioBuffer<float>& block, int ch)
+    {
+        auto* data = block.getWritePointer(ch);
+        
+        // Base: FFT example (AI: Comment out if not needed)
+        fftPlan->performRealOnlyForwardTransform(data);
+        // AI PROMPT: Spectral processing here, e.g.,
+        // for (int bin = 0; bin < kInternalBlockSize / 2; ++bin) { complexGain(data[bin]); }
+        fftPlan->performRealOnlyInverseTransform(data);
+        
+        // AI PROMPT: Add your DSP chain, e.g.,
+        // myIIRFilter.processSamples(data, 0, kInternalBlockSize);  // IIR template below
+        // oversampler.processSamplesUp(data, 0, kInternalBlockSize);  // Oversample stub
+        
+        // SIMD gain (JUCE-optimized)
+        juce::FloatVectorOperations::multiply(data, 1.0001f, kInternalBlockSize);
+    }
+
+    // AI TEMPLATE: Example IIR filter stub (extend in subclass)
+    // virtual void applyIIR(juce::dsp::IIR::Filter<float>& filter, float* data, int numSamples) {
+    //     filter.processSamples(data, 0, numSamples);
+    // }
+
+    //==============================================================================
+    // NON-REAL-TIME SCOPE: GUI/params (safe for I/O)
+    //==============================================================================
+    void getStateInformation(juce::MemoryBlock& destData) override
+    {
+        auto state = parameters.copyState();  // 2025: Use tree for serialization
+        std::unique_ptr<juce::XmlElement> xml(state.createXml());
+        copyXmlToBinary(*xml, destData);
+        // AI: Save custom state, e.g., xml->setAttribute("myParam", myValue);
+    }
+
+    void setStateInformation(const void* data, int sizeInBytes) override
+    {
+        std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+        if (xmlState.get() != nullptr)
+            if (xmlState->hasTagName(parameters.state.getType()))
+                parameters.replaceState(juce::ValueTree::fromXml(*xmlState));
+        // AI: Load custom, e.g., myValue = xmlState->getIntAttribute("myParam");
+    }
+
+    //==============================================================================
+    // Required Overrides (Minimal boilerplate)
+    //==============================================================================
+    const juce::String getName() const override { return "MyPlugin"; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }  // AI: Set for reverb tails
+    
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    
+    bool hasEditor() const override { return true; }
+    juce::AudioProcessorEditor* createEditor() override { return new juce::GenericAudioProcessorEditor(*this); }
+
+    //==============================================================================
+    // Members
+    //==============================================================================
+    static constexpr int kInternalBlockSize = 512;  // AI: Make runtime-configurable
+    double currentSampleRate = 44100.0;
+    bool isDoublePrecision = false;
+    
+    std::unique_ptr<juce::AudioParameterBool> mBypassParam;
+    juce::AudioProcessorValueTreeState parameters { *this, nullptr, "PARAMS", createParameterLayout() };  // 2025 Tree
+    
+    std::unique_ptr<juce::dsp::FFT> fftPlan;
+    juce::AudioBuffer<float> internalBuffer, inputFIFO, outputFIFO;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MyPluginAudioProcessor)
+};
+
+// AI USAGE: Subclass for your plugin, e.g.,
+// class MyEQ : public MyPluginAudioProcessor {
+//     void processFixedBlock(...) override { /* Your EQ chain */ }
+// };
